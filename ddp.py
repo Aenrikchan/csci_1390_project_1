@@ -11,7 +11,7 @@ import json
 
 import utils
 
-class DistributedDataParallel():
+class DistributedDataParallel:
     """
     A module implementation of Distributed Data Parallel (DDP)
     
@@ -26,8 +26,23 @@ class DistributedDataParallel():
         self.device = device
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        self._broadcast_parameters()
 
-    # TODO: Implement!
+    def _broadcast_parameters(self) -> None:
+        """Initialize every model replica with rank 0's parameters."""
+        for parameter in self.model.parameters():
+            dist.broadcast(parameter.data, src=0)
+
+    def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.model(inputs)
+
+    def average_gradients(self) -> None:
+        """Synchronize and average gradients across all model replicas."""
+        for parameter in self.model.parameters():
+            if parameter.grad is None:
+                continue
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            parameter.grad.div_(self.world_size)
 
 
 def train_vgg16_cifar10_ddp_worker(
@@ -100,8 +115,46 @@ def train_vgg16_cifar10_ddp_worker(
     memory_log = []
 
     for i, (inputs, labels) in enumerate(train_loader):
-        # TODO: Implement!
-        pass
+        if i == num_batches:
+            break
+
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        should_record = i >= num_warmup_batches
+
+        utils.sync_if_cuda(device)
+        total_start = time.perf_counter()
+
+        optimizer.zero_grad()
+        utils.sync_if_cuda(device)
+        computation_start = time.perf_counter()
+        outputs = model(inputs)
+        loss = loss_fn(outputs, labels)
+        loss.backward()
+        utils.sync_if_cuda(device)
+        computation_end = time.perf_counter()
+
+        communication_start = time.perf_counter()
+        model.average_gradients()
+        utils.sync_if_cuda(device)
+        communication_end = time.perf_counter()
+
+        optimizer_start = time.perf_counter()
+        optimizer.step()
+        utils.sync_if_cuda(device)
+        optimizer_end = time.perf_counter()
+
+        if should_record:
+            stats[utils.COMP_TIME] += computation_end - computation_start
+            stats[utils.COMM_TIME] += communication_end - communication_start
+            stats[utils.OPT_TIME] += optimizer_end - optimizer_start
+            stats[utils.TOTAL_TIME] += optimizer_end - total_start
+
+    measured_batches = num_batches - num_warmup_batches
+    if measured_batches <= 0:
+        raise ValueError("num_batches must be greater than num_warmup_batches")
+    for key in (utils.COMP_TIME, utils.COMM_TIME, utils.OPT_TIME, utils.TOTAL_TIME):
+        stats[key] /= measured_batches
 
     if check_weights:
         torch.save(model.model.state_dict(), f'./state_dicts/rank_{rank}_weights.pt')
